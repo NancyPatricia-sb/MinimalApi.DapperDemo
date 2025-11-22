@@ -1,0 +1,5 @@
+SELECT TOP (1000) [Id]
+      ,[Title]
+      ,[IsDone]
+      ,[CreatedAt]
+  FROM [CursoApiDb].[dbo].[Todos]

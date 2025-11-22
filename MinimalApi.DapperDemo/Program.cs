@@ -1,24 +1,94 @@
-using System.Data;
-using Microsoft.Data.SqlClient;
-using Dapper;
-using MinimalApi.DapperDemo.Models; 
+using System.Security.Claims;
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.IdentityModel.Tokens;
+using Prometheus;
+using Microsoft.OpenApi.Models;
+using System.IdentityModel.Tokens.Jwt;
 
 var builder = WebApplication.CreateBuilder(args);
+var configuration = builder.Configuration;
 
-// Swagger
+// --- Swagger ---
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-// Registrar IDbConnection como Scoped
-builder.Services.AddScoped<IDbConnection>(sp =>
+builder.Services.AddSwaggerGen(options =>
 {
-    var configuration = sp.GetRequiredService<IConfiguration>();
-    var connectionString = configuration.GetConnectionString("DefaultConnection")
-                          ?? throw new InvalidOperationException("Missing connection string 'DefaultConnection'");
-    return new SqlConnection(connectionString);
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "Practica 6 - JWT + Roles",
+        Version = "v1"
+    });
+
+    // Config para que Swagger permita enviar el JWT
+    var securityScheme = new OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Description = "Escribe: Bearer {tu token JWT}",
+        In = ParameterLocation.Header,
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT"
+    };
+
+    options.AddSecurityDefinition("Bearer", securityScheme);
+
+    var securityRequirement = new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            Array.Empty<string>()
+        }
+    };
+
+    options.AddSecurityRequirement(securityRequirement);
 });
+
+// --- HealthChecks básicos ---
+builder.Services.AddHealthChecks();
+
+// 1) Auth JWT
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        var key = Encoding.UTF8.GetBytes(configuration["Jwt:Key"]!);
+
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = configuration["Jwt:Issuer"],
+            ValidAudience = configuration["Jwt:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(key),
+            ClockSkew = TimeSpan.Zero
+        };
+    });
+
+// 2) Roles / Policies
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy =>
+    {
+        policy.RequireRole("Admin");
+    });
+});
+
+// 3) Dependencias para usuarios en memoria
+builder.Services.AddSingleton<PasswordHasher<User>>();
+builder.Services.AddSingleton<UserStore>();
+
 var app = builder.Build();
 
+// --- Swagger UI ---
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -26,83 +96,169 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-//Los endopoints 
-// GET /todos - obtener todos
-app.MapGet("/todos", async (IDbConnection db) =>
-{
-    const string sql = @"SELECT Id, Title, IsDone, CreatedAt FROM Todos ORDER BY CreatedAt DESC;";
-    var todos = await db.QueryAsync<Todo>(sql);
-    return Results.Ok(todos);
-});
 
-// GET /todos/{id} - obtener uno
-app.MapGet("/todos/{id:int}", async (int id, IDbConnection db) =>
-{
-    const string sql = @"SELECT Id, Title, IsDone, CreatedAt FROM Todos WHERE Id = @Id;";
-    var todo = await db.QueryFirstOrDefaultAsync<Todo>(sql, new { Id = id });
+// --- Prometheus metrics ---
+app.UseHttpMetrics();
 
-    return todo is null ? Results.NotFound() : Results.Ok(todo);
-});
+app.UseAuthentication();
+app.UseAuthorization();
 
-// POST /todos - crear
-app.MapPost("/todos", async (TodoCreateRequest request, IDbConnection db) =>
-{
-    // Validación básica
-    if (string.IsNullOrWhiteSpace(request.Title) || request.Title.Length > 200)
-        return Results.BadRequest("Title is required and must be <= 200 characters.");
-
-    const string sql = @"
-        INSERT INTO Todos (Title, IsDone, CreatedAt)
-        VALUES (@Title, 0, SYSDATETIME());
-        SELECT CAST(SCOPE_IDENTITY() as int);";
-
-    var newId = await db.ExecuteScalarAsync<int>(sql, new { request.Title });
-
-    var createdSql = @"SELECT Id, Title, IsDone, CreatedAt FROM Todos WHERE Id = @Id;";
-    var created = await db.QueryFirstAsync<Todo>(createdSql, new { Id = newId });
-
-    return Results.Created($"/todos/{created.Id}", created);
-});
-
-// PUT /todos/{id} - actualizar
-app.MapPut("/todos/{id:int}", async (int id, TodoUpdateRequest request, IDbConnection db) =>
-{
-    // Validación
-    if (string.IsNullOrWhiteSpace(request.Title) || request.Title.Length > 200)
-        return Results.BadRequest("Title is required and must be <= 200 characters.");
-
-    const string existsSql = @"SELECT COUNT(1) FROM Todos WHERE Id = @Id;";
-    var exists = await db.ExecuteScalarAsync<int>(existsSql, new { Id = id });
-    if (exists == 0)
-        return Results.NotFound();
-
-    const string updateSql = @"
-        UPDATE Todos
-        SET Title = @Title,
-            IsDone = @IsDone
-        WHERE Id = @Id;";
-
-    await db.ExecuteAsync(updateSql, new
+// 4) Endpoint de login: POST /auth/login
+app.MapPost("/auth/login",
+    (LoginRequest request,
+     UserStore userStore,
+     PasswordHasher<User> passwordHasher,
+     IConfiguration config) =>
     {
-        Id = id,
-        request.Title,
-        request.IsDone
-    });
+        var user = userStore.FindByUsername(request.Username);
 
-    var updatedSql = @"SELECT Id, Title, IsDone, CreatedAt FROM Todos WHERE Id = @Id;";
-    var updated = await db.QueryFirstAsync<Todo>(updatedSql, new { Id = id });
+        if (user is null)
+            return Results.Unauthorized();
 
-    return Results.Ok(updated);
-});
+        var result = passwordHasher.VerifyHashedPassword(
+            user,
+            user.PasswordHash,
+            request.Password
+        );
 
-// DELETE /todos/{id} - eliminar
-app.MapDelete("/todos/{id:int}", async (int id, IDbConnection db) =>
+        if (result == PasswordVerificationResult.Failed)
+            return Results.Unauthorized();
+
+        var token = JwtTokenService.GenerateJwtToken(user, config);
+
+        return Results.Ok(new LoginResponse(token));
+    })
+    .WithTags("Auth");
+
+// 5) Endpoint público
+app.MapGet("/public/ping", () => Results.Ok("pong"))
+    .AllowAnonymous()
+    .WithTags("Public");
+
+// 6) Endpoint protegido (cualquier usuario autenticado)
+app.MapGet("/api/me", (ClaimsPrincipal user) =>
 {
-    const string sql = @"DELETE FROM Todos WHERE Id = @Id;";
-    var rows = await db.ExecuteAsync(sql, new { Id = id });
+    var username = user.Identity?.Name;
+    var roles = user.FindAll(ClaimTypes.Role).Select(c => c.Value);
 
-    return rows == 0 ? Results.NotFound() : Results.NoContent();
-});
+    return Results.Ok(new
+    {
+        username,
+        roles
+    });
+})
+    .RequireAuthorization()
+    .WithTags("User");
 
+// 7) Endpoint protegido por rol Admin
+app.MapGet("/admin/secret", () =>
+{
+    return Results.Ok("Sólo admins pueden ver esto.");
+})
+    .RequireAuthorization("AdminOnly")
+    .WithTags("Admin");
+
+// 8) Endpoint para ver entorno
+app.MapGet("/environment", (IHostEnvironment env, IConfiguration cfg) =>
+{
+    return Results.Ok(new
+    {
+        Environment = env.EnvironmentName,
+        ApplicationName = env.ApplicationName,
+        MachineName = Environment.MachineName
+    });
+})
+    .AllowAnonymous()
+    .WithTags("Info");
+
+// ------------------------------
+// *** HEALTH QUE SALE EN SWAGGER ***
+// ------------------------------
+app.MapGet("/health", () => Results.Ok(new { status = "OK" }))
+   .WithTags("Health");
+
+// HealthCheck real (no visible en swagger)
+app.MapHealthChecks("/health")
+   .WithTags("Health");
+
+// 10) Endpoint de métricas de Prometheus
+app.MapMetrics("/metrics")
+   .WithTags("Metrics");
 
 app.Run();
+
+
+// ======= TIPOS Y SERVICIOS (DESPUÉS de app.Run) =======
+
+record LoginRequest(string Username, string Password);
+record LoginResponse(string AccessToken);
+
+public record User(Guid Id, string Username, string PasswordHash, string[] Roles);
+
+public class UserStore
+{
+    private readonly List<User> _users = new();
+    private readonly PasswordHasher<User> _passwordHasher;
+
+    public UserStore(PasswordHasher<User> passwordHasher)
+    {
+        _passwordHasher = passwordHasher;
+        Seed();
+    }
+
+    private void Seed()
+    {
+        // usuario admin
+        AddUser("admin", "Admin123!", new[] { "Admin", "User" });
+
+        // usuario normal
+        AddUser("juan", "User123!", new[] { "User" });
+    }
+
+    private void AddUser(string username, string plainPassword, string[] roles)
+    {
+        var user = new User(Guid.NewGuid(), username, "", roles);
+        var hash = _passwordHasher.HashPassword(user, plainPassword);
+
+        _users.Add(user with { PasswordHash = hash });
+    }
+
+    public User? FindByUsername(string username) =>
+        _users.SingleOrDefault(u =>
+            string.Equals(u.Username, username, StringComparison.OrdinalIgnoreCase));
+}
+
+public static class JwtTokenService
+{
+    public static string GenerateJwtToken(User user, IConfiguration configuration)
+    {
+        var key = new SymmetricSecurityKey(
+            Encoding.UTF8.GetBytes(configuration["Jwt:Key"]!)
+        );
+
+        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+        var claims = new List<Claim>
+        {
+            new(JwtRegisteredClaimNames.Sub, user.Username),
+            new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+            new(ClaimTypes.NameIdentifier, user.Id.ToString()),
+            new(ClaimTypes.Name, user.Username)
+        };
+
+        foreach (var role in user.Roles)
+        {
+            claims.Add(new Claim(ClaimTypes.Role, role));
+        }
+
+        var token = new JwtSecurityToken(
+            issuer: configuration["Jwt:Issuer"],
+            audience: configuration["Jwt:Audience"],
+            claims: claims,
+            expires: DateTime.UtcNow.AddMinutes(30),
+            signingCredentials: creds
+        );
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+}
